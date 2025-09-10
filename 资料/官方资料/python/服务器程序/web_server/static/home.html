@@ -1,0 +1,265 @@
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <script src='pcm-player.js'></script>
+    <script src='mqtt.js'></script>
+</head>
+
+
+<body>
+    <h5>请输入要发布的消息的主题</h5>
+    <input type="text" id="topicInput" value="teacher/cmd" />
+    <br />
+    <br />
+    <button id='b1' onclick='startRecording()'>开始发送我的声音</button>
+    <button id='b2' onclick='stopRecording()'>停止发生我的声音</button>
+    <br />
+    <br />
+    <button id='b3' onclick="startRecvFromEsp()">开始接听来访者声音</button>
+    <button id='b4' onclick="stopRecvFromEsp()">停止接收来访者声音</button>
+    <br />
+    <br />
+    <button id='b5' onclick="startPlayVideo()">开始播放视频</button>
+    <button id='b6' onclick="stopPlayVideo()">停止播放视频</button>
+    <div>视频: <span id="webSocketStatus">未连接</span></div>
+    <div><img id="liveImage" src="/static/image.jpeg" alt="Live Image" style="max-width: 500px;"></div>
+</body>
+
+<script>
+    // websocket地址
+    let websocket_url = 'ws://localhost:8000/ws/to_browser';
+    let bufferSize = 8192,
+        AudioContext,
+        context,
+        processor,
+        input,
+        globalStream,
+        websocket;
+
+    // 初始化浏览器的websocket
+    initWebSocket();
+
+    // 初始化播放器
+    let player = new PCMPlayer({
+        encoding: '16bitInt',
+        channels: 1,
+        // esp32以16000Hz采集声音，浏览器以32000Hz播放声音
+        sampleRate: 16000,
+        flushingTime: 2000
+    });
+
+
+
+    // 初始化websocket
+    function initWebSocket() {
+        websocket = new WebSocket(websocket_url);
+        websocket.onopen = function () {
+            document.getElementById("webSocketStatus").innerHTML = '已连接';
+        };
+        websocket.onclose = function (e) {
+            document.getElementById("webSocketStatus").innerHTML = '未连接';
+        };
+        websocket.onmessage = function (e) {
+            e.data.arrayBuffer().then(buffer => {
+                player.feed(new Int16Array(buffer));
+            });
+        };
+    }
+
+    function downsampleBuffer(buffer, sampleRate, outSampleRate) {
+        let sampleRateRatio = sampleRate / outSampleRate;
+        let newLength = Math.round(buffer.length / sampleRateRatio);
+        let result = new Int16Array(newLength);
+        let offsetResult = 0;
+        let offsetBuffer = 0;
+        while (offsetResult < result.length) {
+            let nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+            let accum = 0;
+            let count = 0;
+            for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+                accum += buffer[i];
+                count++;
+            }
+
+            result[offsetResult] = Math.min(1, accum / count) * 0x7FFF;
+            offsetResult++;
+            offsetBuffer = nextOffsetBuffer;
+        }
+
+        return result.buffer;
+    }
+
+    const mqtt_client = mqtt.connect('ws://broker.emqx.io:8083/mqtt'); // 使用 MQTT.js 连接 Broker
+
+    // 绑定监听
+    mqtt_client.on('connect', () => {
+        // 订阅消息队列1
+        mqtt_client.subscribe('teacher/cmd', (err) => {
+            if (!err) {
+                console.log('Subscribed to cmd TOPIC');
+            }
+        });
+
+        mqtt_client.subscribe('teacher/data', (err) => {
+            if (!err) {
+                console.log('Subscribed to data TOPIC');
+            }
+        });
+    });
+
+    // 给指定的消息队列发送数据
+    function mqtt_sendMessage(message, queueName = 'teacher/cmd') {
+        // 消息队列名字可以随时改： test/1, message:发送的消息数据
+        mqtt_client.publish(queueName, message);
+        console.log(`发送消息给${queueName}队列`);
+    }
+
+    const b1 = document.getElementById('b1');
+    const b2 = document.getElementById('b2');
+    const b3 = document.getElementById('b3');
+    const b4 = document.getElementById('b4');
+    const b5 = document.getElementById('b5');
+    const b6 = document.getElementById('b6');
+
+
+    const inputLable = document.getElementById("topicInput");
+
+    // 通过浏览器的麦克风api采集声音
+    function startRecording() {
+        b1.disabled = true;
+        b2.disabled = false;
+
+        const topic = inputLable.value;
+        mqtt_sendMessage(JSON.stringify({
+            "cmd": "on", "type": "audio", "dir": "client2esp"
+        }), topic);
+
+        streamStreaming = true;
+        AudioContext = window.AudioContext || window.webkitAudioContext;
+        context = new AudioContext({
+            latencyHint: 'interactive',
+        });
+        processor = context.createScriptProcessor(bufferSize, 1, 1);
+        processor.connect(context.destination);
+        context.resume();
+
+        let handleSuccess = function (stream) {
+            const sampleRate = stream.getAudioTracks()[0].getSettings().sampleRate;
+            console.log(sampleRate);
+            globalStream = stream;
+            input = context.createMediaStreamSource(stream);
+            input.connect(processor);
+
+            processor.onaudioprocess = function (e) {
+                // 以48000Hz采集声音数据
+                let left = e.inputBuffer.getChannelData(0);
+                // 降采样为32000Hz的声音数据
+                let left16 = downsampleBuffer(left, 48000, 16000);
+                // 将声音数据通过websocket发送给esp32
+                websocket.send(left16);
+            };
+        };
+
+        navigator.mediaDevices.getUserMedia({ audio: true, video: false }).then(handleSuccess);
+    }
+
+    // 停止采集声音
+    function stopRecording() {
+        b1.disabled = false;
+        b2.disabled = true;
+
+        const topic = inputLable.value;
+        mqtt_sendMessage(JSON.stringify({
+            "cmd": "off", "type": "audio", "dir": "client2esp"
+        }), topic);
+        streamStreaming = false;
+
+        let track = globalStream.getTracks()[0];
+        track.stop();
+
+        input.disconnect(processor);
+        processor.disconnect(context.destination);
+        context.close().then(function () {
+            input = null;
+            processor = null;
+            context = null;
+            AudioContext = null;
+        });
+    }
+
+    function startRecvFromEsp() {
+        b3.disabled = true;
+        b4.disabled = false;
+
+        const topic = inputLable.value;
+        mqtt_sendMessage(JSON.stringify({
+            "cmd": "on", "type": "audio", "dir": "esp2client"
+        }), topic);
+    }
+
+    function stopRecvFromEsp() {
+        b3.disabled = false;
+        b4.disabled = true;
+
+        const topic = inputLable.value;
+        mqtt_sendMessage(JSON.stringify({
+            "cmd": "off", "type": "audio", "dir": "esp2client"
+        }), topic)
+    }
+    const liveImage = document.getElementById('liveImage');
+    const newImage = new Image();
+
+    var id = -1;
+
+    function startPlayVideo() {
+        b5.disabled = true;
+        b6.disabled = false;
+
+        const topic = inputLable.value;
+        mqtt_sendMessage(JSON.stringify({
+            "cmd": "on", "type": "video", "dir": "esp2client"
+        }), topic);
+
+        if (id == -1) {
+            id = setInterval(() => {
+                const timestamp = new Date().getTime();
+                newImage.src = `/static/image.jpeg?timestamp=${timestamp}`;
+                // 当新图片加载完成后，替换当前图片
+                newImage.onload = () => {
+                    liveImage.src = newImage.src;
+                };
+            }, 30);
+        }
+
+
+    }
+
+    function stopPlayVideo() {
+        b5.disabled = false;
+        b6.disabled = true;
+
+        const topic = inputLable.value;
+        mqtt_sendMessage(JSON.stringify({
+            "cmd": "off", "type": "video", "dir": "esp2client"
+        }), topic)
+
+        if (id != -1) {
+            clearInterval(id);
+            id = -1;
+        }
+
+    }
+
+    // 接收来自消息队列1的数据
+    mqtt_client.on('message', (topic, message) => {
+        console.log(JSON.parse(message.toString()));
+    });
+</script>
+
+
+<script>
+
+</script>
+
+</html>
